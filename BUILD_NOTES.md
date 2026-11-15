@@ -120,3 +120,60 @@ model-claimed.
   adaptive: it learns from actual refusals, never from a predicted draw.
 - `main.ts` was written in three separate write messages (entrypoint rule:
   ≥2 messages touching the entrypoint).
+
+## Round 3 — hill-climb polish (15 Nov ~21:30 WIB)
+
+Goal: cut mean upstream calls 22.0 -> 20-21 at quality >= 98 (the only gap to
+the top 5: they are 99/98/20, we are 99/98/22, dev rank #225/3000).
+
+What was tried (sim, 3 practice trials + 1000 fresh instances, seed
+Random(20261114); baseline = round-2 winner, greedy exact table lambda=6000,
+failover K=200, re-plan every request: real 22/23/21 mean 22.00 q98, fresh
+mean 22.93, mean_q 97.39, P(score99) 0.90, P(top5) 0.25):
+
+- lambda sweep 4000/5000: real 21.67 (t1 23->22) BUT fresh worse (mean 23.02,
+  P(top5) 0.22). Practice-trial noise; rejected.
+- lambda 7000-12000: identical to baseline. No gain.
+- Failover K 100/400/600/1000/2000/5000: real unchanged (22.00). K>=1000
+  fresh mean 22.73, P(top5) 0.27; saturates at K~1000. Marginal only.
+- Re-plan static: same as every (fresh 22.88, P(top5) 0.25). The re-plan
+  drift hypothesis is false. Re-plan on_refusal only: real 26.00, fresh
+  25.96 (quality up to 98.17 but calls explode); rejected decisively — the
+  per-request re-plan is essential.
+- Posterior failover (exact plan + fail_risk_posterior): real 22.33, fresh
+  22.90. Worse; rejected (confirms round 2).
+- Local search (greedy + hill-climb, qcap=650): real 22.67, fresh mean
+  22.28 BUT P(score99) collapses 0.90 -> 0.73, P(top5) 0.19. The quality
+  cap was too loose (plan loss 637 vs q98 budget 764); rejected.
+- Local search, quality-guarded (qcap=550 and qcap=592, identical
+  results): real 23/22/21 mean 22.00 q98/98/98; fresh (1000) mean 22.43,
+  med 22, mean_q 97.77, P(score99) 0.95, P(top5) 0.35, P(<=20) 0.10.
+  The win comes from hill-climbing the RE-PLANS, not the initial plan
+  (qcap=550's initial plan is identical to greedy, yet the results differ).
+  LS + K=1000: no further gain (P(top5) 0.34).
+
+Chosen improvement (this change, lib/routing.ts only): `climbPlan` polishes
+the greedy slot plan. The greedy prices slots in assignment (weight) order,
+but calls happen in arrival order, so its expectation is optimistic; the
+climb re-prices in arrival order (planMetrics) and repeatedly moves the
+single request whose move to another provider cuts the expected refusals
+most (ties: lowest quality loss), as long as plan quality loss stays within
+PLAN_QUALITY_CAP = 592 — the greedy plan's own loss, so the climb never
+sacrifices more quality than greedy already does. At most 8 moves,
+deterministic (brief order, first strictly-best move wins). Runs inside
+computePlan, so every per-request re-plan is polished too.
+
+Verified end-to-end (grade-local, --driver process, --instances 3):
+t0 99/98/23, t1 99/98/22, t2 99/98/21 -> mean 22.00, quality 98/98/98,
+score 99 on all three; served/wire/failover/catalog 100. Matches the sim
+exactly (23/22/21). One bug found and fixed during verification: computePlan
+is also called at load time with startCalls undefined; planMetrics iterated
+it and crashed (entry exited 1, all scores 0). Fixed by normalising
+startCalls to an empty map inside climbPlan.
+
+Caveat for the resubmit decision: the practice-trial mean is 22.00 — the
+same as round 2, NOT below 22.0, so the strict "resubmit only if local <
+22.0" gate is not met. The improvement is on fresh draws (the scored
+trials are fresh draws from drand round 33997812): P(top5) 0.25 -> 0.35,
+mean calls 22.93 -> 22.43, P(score99) 0.90 -> 0.95. Submitting replaces the
+round-2 entry with one that is equal on practice and better on fresh.
